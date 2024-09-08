@@ -1,1 +1,858 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.10.14","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceId":2468162,"sourceType":"datasetVersion","datasetId":1493018}],"dockerImageVersionId":30762,"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"# imports\nimport h5py\nimport wandb\nimport numpy as np\nimport pandas as pd\nfrom time import time\nimport matplotlib.pyplot as plt\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay\n\nimport torch\nimport torch.nn as nn\nimport torch.optim as optim\nimport torch.nn.functional as F\nfrom torch.utils.data import DataLoader, Dataset","metadata":{"_uuid":"8f2839f25d086af736a60e9eeb907d3b93b6e0e5","_cell_guid":"b1076dfc-b9ad-4769-8c92-a6c4dae69d19","execution":{"iopub.status.busy":"2024-09-08T19:30:23.957691Z","iopub.execute_input":"2024-09-08T19:30:23.958006Z","iopub.status.idle":"2024-09-08T19:30:31.201072Z","shell.execute_reply.started":"2024-09-08T19:30:23.957972Z","shell.execute_reply":"2024-09-08T19:30:31.200027Z"},"trusted":true},"execution_count":1,"outputs":[]},{"cell_type":"code","source":"# Read the dataset\ndataset_file = h5py.File(\"/kaggle/input/radioml2018/GOLD_XYZ_OSC.0001_1024.hdf5\", \"r\")\n\n# Base modulation classes\nbase_modulation_classes = [\n    'OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK',\n    '16APSK', '32APSK', '64APSK', '128APSK', '16QAM', '32QAM', '64QAM',\n    '128QAM', '256QAM', 'AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC',\n    'FM', 'GMSK', 'OQPSK'\n]\n\n# Selected modulation classes\nselected_modulation_classes = [\n    '4ASK', 'BPSK', 'QPSK', '16PSK', '16QAM', 'FM', 'AM-DSB-WC', '32APSK'\n]\n\n# Get the indices of selected modulation classes\nselected_classes_id = [base_modulation_classes.index(cls) for cls in selected_modulation_classes]","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:30:34.897825Z","iopub.execute_input":"2024-09-08T19:30:34.898430Z","iopub.status.idle":"2024-09-08T19:30:34.924238Z","shell.execute_reply.started":"2024-09-08T19:30:34.898388Z","shell.execute_reply":"2024-09-08T19:30:34.923106Z"},"trusted":true},"execution_count":2,"outputs":[]},{"cell_type":"code","source":"# Model\n\nclass SEBlock(nn.Module):\n    \"\"\" Squeeze-and-Excitation Block \"\"\"\n    def __init__(self, channels, reduction=16):\n        super(SEBlock, self).__init__()\n        self.se = nn.Sequential(\n            nn.AdaptiveAvgPool2d(1),\n            nn.Conv2d(channels, channels // reduction, 1),\n            nn.ReLU(),\n            nn.Conv2d(channels // reduction, channels, 1),\n            nn.Sigmoid()\n        )\n\n    def forward(self, x):\n        scale = self.se(x)\n        return x * scale\n\nclass MultiHeadAttention(nn.Module):\n    \"\"\" Multi-Head Attention Module \"\"\"\n    def __init__(self, d_model, num_heads):\n        super(MultiHeadAttention, self).__init__()\n        self.attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)\n\n    def forward(self, x):\n        attn_output, _ = self.attention(x, x, x)\n        return attn_output\n\nclass RadioNet(nn.Module):\n    def __init__(self, num_classes):\n        super(RadioNet, self).__init__()\n\n        # Separate Convolutional Pathways for I and Q\n        self.q_conv = nn.Sequential(\n            nn.Conv2d(1, 64, 3, padding=1),\n            nn.BatchNorm2d(64),\n            nn.LeakyReLU(0.1),\n            SEBlock(64),\n            nn.Conv2d(64, 128, 3, padding=1),\n            nn.BatchNorm2d(128),\n            nn.LeakyReLU(0.1),\n            nn.MaxPool2d(2, stride=2),\n            nn.Conv2d(128, 256, 3, padding=1),\n            nn.BatchNorm2d(256),\n            nn.LeakyReLU(0.1),\n            SEBlock(256),\n            nn.MaxPool2d(2, stride=2)\n        )\n\n        self.i_conv = nn.Sequential(\n            nn.Conv2d(1, 64, 3, padding=1),\n            nn.BatchNorm2d(64),\n            nn.LeakyReLU(0.1),\n            SEBlock(64),\n            nn.Conv2d(64, 128, 3, padding=1),\n            nn.BatchNorm2d(128),\n            nn.LeakyReLU(0.1),\n            nn.MaxPool2d(2, stride=2),\n            nn.Conv2d(128, 256, 3, padding=1),\n            nn.BatchNorm2d(256),\n            nn.LeakyReLU(0.1),\n            SEBlock(256),\n            nn.MaxPool2d(2, stride=2)\n        )\n\n        self.feature_size = self._get_conv_output((1, 32, 32))\n\n        # Bidirectional LSTM with Layer Normalization\n        self.lstm = nn.LSTM(self.feature_size * 2, 512, num_layers=2, \n                            batch_first=True, bidirectional=True, dropout=0.3)\n        self.layer_norm = nn.LayerNorm(1024)  # Layer normalization after LSTM\n\n        # Multi-Head Attention with multiple heads\n        self.multi_head_attn = MultiHeadAttention(1024, num_heads=8)\n\n        # Enhanced Fully Connected Layers with Dense Connections\n        self.fc = nn.Sequential(\n            nn.Linear(1024, 1024),\n            nn.LeakyReLU(0.1),\n            nn.Dropout(0.5),\n            nn.Linear(1024, 512),\n            nn.LeakyReLU(0.1),\n            nn.Dropout(0.5),\n            nn.Linear(512, 256),\n            nn.LeakyReLU(0.1),\n            nn.Dropout(0.3),\n            nn.Linear(256, 64),\n            nn.LeakyReLU(0.1)\n        )\n\n        self.output = nn.Linear(64, num_classes)\n\n    def _get_conv_output(self, shape):\n        input = torch.rand(1, *shape)\n        output = self.q_conv(input)\n        return int(torch.numel(output) / output.shape[0])\n\n    def forward(self, i_input, q_input):\n        q = self.q_conv(q_input)\n        q = q.view(q.size(0), -1)\n\n        i = self.i_conv(i_input)\n        i = i.view(i.size(0), -1)\n\n        combined = torch.cat((q, i), dim=1)\n        combined = combined.unsqueeze(1)  # Add sequence dimension\n\n        lstm_out, _ = self.lstm(combined)\n        lstm_out = self.layer_norm(lstm_out)\n\n        # Apply Multi-Head Attention\n        attn_output = self.multi_head_attn(lstm_out)\n        context = torch.sum(attn_output, dim=1)  # Sum up the attended output\n\n        x = self.fc(context)\n        x = self.output(x)\n\n        return torch.log_softmax(x, dim=1)\n\ndef create_model(num_classes):\n    model = RadioNet(num_classes)\n    learning_rate = 0.0003\n    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)\n    loss_fn = nn.CrossEntropyLoss()\n    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)\n    return model, optimizer, loss_fn, scheduler","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:31:05.881750Z","iopub.execute_input":"2024-09-08T19:31:05.882628Z","iopub.status.idle":"2024-09-08T19:31:05.907537Z","shell.execute_reply.started":"2024-09-08T19:31:05.882588Z","shell.execute_reply":"2024-09-08T19:31:05.906656Z"},"trusted":true},"execution_count":3,"outputs":[]},{"cell_type":"code","source":"# Initialize model, optimizer, and loss function\nnum_classes = len(selected_modulation_classes)\nmodel, optimizer, loss_fn, scheduler = create_model(num_classes)","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:31:16.452091Z","iopub.execute_input":"2024-09-08T19:31:16.452852Z","iopub.status.idle":"2024-09-08T19:31:19.005504Z","shell.execute_reply.started":"2024-09-08T19:31:16.452812Z","shell.execute_reply":"2024-09-08T19:31:19.004395Z"},"trusted":true},"execution_count":4,"outputs":[{"name":"stderr","text":"/opt/conda/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n  warnings.warn(\n","output_type":"stream"}]},{"cell_type":"code","source":"# Check if multiple GPUs are available and use them if possible\nif torch.cuda.device_count() > 1:\n    print(f\"Let's use {torch.cuda.device_count()} GPUs!\")\n    # Wrap the model with DataParallel to parallelize across available GPUs\n    model = nn.DataParallel(model)\n\n# Set device to CUDA if available, otherwise fallback to CPU\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n\n# Move the model to the appropriate device (GPU or CPU)\nmodel.to(device)","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:31:35.130730Z","iopub.execute_input":"2024-09-08T19:31:35.131438Z","iopub.status.idle":"2024-09-08T19:31:35.657736Z","shell.execute_reply.started":"2024-09-08T19:31:35.131397Z","shell.execute_reply":"2024-09-08T19:31:35.656762Z"},"trusted":true},"execution_count":5,"outputs":[{"name":"stdout","text":"Let's use 2 GPUs!\n","output_type":"stream"},{"execution_count":5,"output_type":"execute_result","data":{"text/plain":"DataParallel(\n  (module): RadioNet(\n    (q_conv): Sequential(\n      (0): Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (2): LeakyReLU(negative_slope=0.1)\n      (3): SEBlock(\n        (se): Sequential(\n          (0): AdaptiveAvgPool2d(output_size=1)\n          (1): Conv2d(64, 4, kernel_size=(1, 1), stride=(1, 1))\n          (2): ReLU()\n          (3): Conv2d(4, 64, kernel_size=(1, 1), stride=(1, 1))\n          (4): Sigmoid()\n        )\n      )\n      (4): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (5): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (6): LeakyReLU(negative_slope=0.1)\n      (7): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n      (8): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (9): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (10): LeakyReLU(negative_slope=0.1)\n      (11): SEBlock(\n        (se): Sequential(\n          (0): AdaptiveAvgPool2d(output_size=1)\n          (1): Conv2d(256, 16, kernel_size=(1, 1), stride=(1, 1))\n          (2): ReLU()\n          (3): Conv2d(16, 256, kernel_size=(1, 1), stride=(1, 1))\n          (4): Sigmoid()\n        )\n      )\n      (12): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n    )\n    (i_conv): Sequential(\n      (0): Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (2): LeakyReLU(negative_slope=0.1)\n      (3): SEBlock(\n        (se): Sequential(\n          (0): AdaptiveAvgPool2d(output_size=1)\n          (1): Conv2d(64, 4, kernel_size=(1, 1), stride=(1, 1))\n          (2): ReLU()\n          (3): Conv2d(4, 64, kernel_size=(1, 1), stride=(1, 1))\n          (4): Sigmoid()\n        )\n      )\n      (4): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (5): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (6): LeakyReLU(negative_slope=0.1)\n      (7): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n      (8): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n      (9): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n      (10): LeakyReLU(negative_slope=0.1)\n      (11): SEBlock(\n        (se): Sequential(\n          (0): AdaptiveAvgPool2d(output_size=1)\n          (1): Conv2d(256, 16, kernel_size=(1, 1), stride=(1, 1))\n          (2): ReLU()\n          (3): Conv2d(16, 256, kernel_size=(1, 1), stride=(1, 1))\n          (4): Sigmoid()\n        )\n      )\n      (12): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n    )\n    (lstm): LSTM(32768, 512, num_layers=2, batch_first=True, dropout=0.3, bidirectional=True)\n    (layer_norm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)\n    (multi_head_attn): MultiHeadAttention(\n      (attention): MultiheadAttention(\n        (out_proj): NonDynamicallyQuantizableLinear(in_features=1024, out_features=1024, bias=True)\n      )\n    )\n    (fc): Sequential(\n      (0): Linear(in_features=1024, out_features=1024, bias=True)\n      (1): LeakyReLU(negative_slope=0.1)\n      (2): Dropout(p=0.5, inplace=False)\n      (3): Linear(in_features=1024, out_features=512, bias=True)\n      (4): LeakyReLU(negative_slope=0.1)\n      (5): Dropout(p=0.5, inplace=False)\n      (6): Linear(in_features=512, out_features=256, bias=True)\n      (7): LeakyReLU(negative_slope=0.1)\n      (8): Dropout(p=0.3, inplace=False)\n      (9): Linear(in_features=256, out_features=64, bias=True)\n      (10): LeakyReLU(negative_slope=0.1)\n    )\n    (output): Linear(in_features=64, out_features=8, bias=True)\n  )\n)"},"metadata":{}}]},{"cell_type":"code","source":"# Number of SNRs (from 30 SNR to 22 SNR)\nN_SNR = 4 \n\n# Initialize placeholders for data\nX_data = None\ny_data = None\n\n# Loop through selected modulation classes\nfor id in selected_classes_id:\n    # Load data slices based on indices\n    X_slice = dataset_file['X'][(106496*(id+1) - 4096*N_SNR) : 106496*(id+1)]\n    y_slice = dataset_file['Y'][(106496*(id+1) - 4096*N_SNR) : 106496*(id+1)]\n    \n    # Concatenate the slices to build the dataset\n    if X_data is not None:\n        X_data = np.concatenate([X_data, X_slice], axis=0)\n        y_data = np.concatenate([y_data, y_slice], axis=0)\n    else:\n        X_data = X_slice\n        y_data = y_slice\n\n# Reshape the X_data to the required shape (e.g., 32x32 with 2 channels)\nX_data = X_data.reshape(len(X_data), 32, 32, 2)\n\n# Convert y_data to a DataFrame for easier manipulation\ny_data_df = pd.DataFrame(y_data)\n\n# Drop columns where the sum is 0 (i.e., no modulation class data in that column)\nfor column in y_data_df.columns:\n    if sum(y_data_df[column]) == 0:\n        y_data_df = y_data_df.drop(columns=[column])\n\n# Assign the remaining columns to match the selected modulation classes\ny_data_df.columns = selected_modulation_classes\n\n# Split the dataset into training and test sets (80-20 split)\nX_train, X_test, y_train, y_test = train_test_split(X_data, y_data_df, test_size=0.2)","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:31:42.941001Z","iopub.execute_input":"2024-09-08T19:31:42.941807Z","iopub.status.idle":"2024-09-08T19:31:59.970595Z","shell.execute_reply.started":"2024-09-08T19:31:42.941764Z","shell.execute_reply":"2024-09-08T19:31:59.969607Z"},"trusted":true},"execution_count":6,"outputs":[]},{"cell_type":"code","source":"# Define the custom Dataset class\nclass RadioMLDataset(Dataset):\n    def __init__(self, X, y):\n        self.X = torch.from_numpy(X).float().to(device)  # Convert X to a PyTorch tensor\n        self.y = torch.from_numpy(y.values).float().to(device)  # Convert y to a PyTorch tensor\n    \n    def __len__(self):\n        return len(self.X)  # Return the number of samples in the dataset\n    \n    def __getitem__(self, idx):\n        return self.X[idx], self.y[idx]  # Return a sample and its corresponding label\n\n# Create Dataset objects for training and testing data\ntrain_dataset = RadioMLDataset(X_train, y_train)\ntest_dataset = RadioMLDataset(X_test, y_test)\n\n# Create DataLoader objects for batching and shuffling data\nbatch_size = 32  # You can adjust the batch size as needed\ntrain_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  # Shuffle training data\ntest_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)  # No shuffling for test data\n\n# Example of how to use the DataLoader\nfor batch_X, batch_y in train_loader:\n    # batch_X and batch_y are PyTorch tensors\n    # batch_X shape: (batch_size, 32, 32, 2)\n    # batch_y shape: (batch_size, num_classes)\n    print(f\"Batch X shape: {batch_X.shape}\")\n    print(f\"Batch y shape: {batch_y.shape}\")\n    break  # This breaks the loop after the first batch, just to demonstrate","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:32:31.832639Z","iopub.execute_input":"2024-09-08T19:32:31.833628Z","iopub.status.idle":"2024-09-08T19:32:32.130524Z","shell.execute_reply.started":"2024-09-08T19:32:31.833582Z","shell.execute_reply":"2024-09-08T19:32:32.129408Z"},"trusted":true},"execution_count":7,"outputs":[{"name":"stdout","text":"Batch X shape: torch.Size([32, 32, 32, 2])\nBatch y shape: torch.Size([32, 8])\n","output_type":"stream"}]},{"cell_type":"code","source":"# Training parameters\nepochs = 25\npatience = 10\nbest_acc = 0\nno_improve = 0\npath_checkpoint = \"model_checkpoint.pth\"\n\n# Training loop\ntrain_losses, train_accs, val_losses, val_accs = [], [], [], []","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:32:37.138316Z","iopub.execute_input":"2024-09-08T19:32:37.138759Z","iopub.status.idle":"2024-09-08T19:32:37.144522Z","shell.execute_reply.started":"2024-09-08T19:32:37.138701Z","shell.execute_reply":"2024-09-08T19:32:37.143428Z"},"trusted":true},"execution_count":8,"outputs":[]},{"cell_type":"code","source":"# wandb login\nfrom kaggle_secrets import UserSecretsClient\n\nuser_secrets = UserSecretsClient()\nmy_secret = user_secrets.get_secret(\"wandb_api_key\") \nwandb.login(key=my_secret)","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:32:40.376511Z","iopub.execute_input":"2024-09-08T19:32:40.377216Z","iopub.status.idle":"2024-09-08T19:32:42.433187Z","shell.execute_reply.started":"2024-09-08T19:32:40.377176Z","shell.execute_reply":"2024-09-08T19:32:42.432231Z"},"trusted":true},"execution_count":9,"outputs":[{"name":"stderr","text":"\u001b[34m\u001b[1mwandb\u001b[0m: W&B API key is configured. Use \u001b[1m`wandb login --relogin`\u001b[0m to force relogin\n\u001b[34m\u001b[1mwandb\u001b[0m: \u001b[33mWARNING\u001b[0m If you're specifying your api key in code, ensure this code is not shared publicly.\n\u001b[34m\u001b[1mwandb\u001b[0m: \u001b[33mWARNING\u001b[0m Consider setting the WANDB_API_KEY environment variable, or running `wandb login` from the command line.\n\u001b[34m\u001b[1mwandb\u001b[0m: Appending key for api.wandb.ai to your netrc file: /root/.netrc\n","output_type":"stream"},{"execution_count":9,"output_type":"execute_result","data":{"text/plain":"True"},"metadata":{}}]},{"cell_type":"code","source":"# Initialize wandb\nwandb.init(project=\"RadioML\", name=\"RadioNet\")\n\n# Log model architecture\nwandb.watch(model)\n\nfor epoch in range(epochs):\n    # Set model to training mode\n    model.train()\n    train_loss, train_correct = 0, 0\n    # Training loop\n    for batch_X, batch_y in train_loader:\n        # Split the input into I and Q components\n        i_input = batch_X[:, :, :, 0].unsqueeze(1)  # I component\n        q_input = batch_X[:, :, :, 1].unsqueeze(1)  # Q component\n        # Zero out the gradients\n        optimizer.zero_grad()\n        # Forward pass through the model\n        outputs = model(i_input, q_input)\n        # Compute loss\n        loss = loss_fn(outputs, batch_y)\n        # Backpropagation\n        loss.backward()\n        # Update model parameters\n        optimizer.step()\n        # Accumulate training loss and correct predictions\n        train_loss += loss.item()\n        train_correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()\n    # Compute average training loss and accuracy\n    train_loss /= len(train_loader)\n    train_acc = train_correct / len(train_dataset)\n    # Validation loop (without gradient updates)\n    model.eval()\n    val_loss, val_correct = 0, 0\n    with torch.no_grad():\n        for batch_X, batch_y in test_loader:\n            # Split the input into I and Q components\n            i_input = batch_X[:, :, :, 0].unsqueeze(1)  # I component\n            q_input = batch_X[:, :, :, 1].unsqueeze(1)  # Q component\n            # Forward pass through the model\n            outputs = model(i_input, q_input)\n            # Compute validation loss\n            val_loss += loss_fn(outputs, batch_y).item()\n            # Accumulate correct predictions\n            val_correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()\n    # Compute average validation loss and accuracy\n    val_loss /= len(test_loader)\n    val_acc = val_correct / len(test_dataset)\n    # Save loss and accuracy for later plotting\n    train_losses.append(train_loss)\n    train_accs.append(train_acc)\n    val_losses.append(val_loss)\n    val_accs.append(val_acc)\n\n    # Log metrics to wandb\n    wandb.log({\n        \"epoch\": epoch + 1,\n        \"train_loss\": train_loss,\n        \"train_acc\": train_acc,\n        \"val_loss\": val_loss,\n        \"val_acc\": val_acc,\n        \"learning_rate\": optimizer.param_groups[0]['lr']\n    })\n\n    # Print progress for this epoch\n    print(f\"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, \"\n          f\"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\")\n    # Step the learning rate scheduler based on validation loss\n    scheduler.step(val_loss)\n    # Early stopping and model checkpointing\n    if val_acc > best_acc:\n        best_acc = val_acc\n        torch.save(model.state_dict(), path_checkpoint)  # Save the model checkpoint\n        wandb.save(path_checkpoint)  # Save the model checkpoint to wandb\n        no_improve = 0  # Reset no improvement counter\n    else:\n        no_improve += 1\n        if no_improve == patience:\n            print(\"Early stopping\")\n            break\n\n# Finish the wandb run\nwandb.finish()","metadata":{"execution":{"iopub.status.busy":"2024-09-08T19:32:47.571108Z","iopub.execute_input":"2024-09-08T19:32:47.572249Z"},"trusted":true},"execution_count":null,"outputs":[{"name":"stderr","text":"\u001b[34m\u001b[1mwandb\u001b[0m: Currently logged in as: \u001b[33mdevcode03\u001b[0m (\u001b[33mdevcode03-gujarat-technological-university\u001b[0m). Use \u001b[1m`wandb login --relogin`\u001b[0m to force relogin\n","output_type":"stream"},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":"wandb version 0.17.9 is available!  To upgrade, please run:\n $ pip install wandb --upgrade"},"metadata":{}},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":"Tracking run with wandb version 0.17.7"},"metadata":{}},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":"Run data is saved locally in <code>/kaggle/working/wandb/run-20240908_193247-d9nv2kbx</code>"},"metadata":{}},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":"Syncing run <strong><a href='https://wandb.ai/devcode03-gujarat-technological-university/RadioML/runs/d9nv2kbx' target=\"_blank\">RadioNet</a></strong> to <a href='https://wandb.ai/devcode03-gujarat-technological-university/RadioML' target=\"_blank\">Weights & Biases</a> (<a href='https://wandb.me/run' target=\"_blank\">docs</a>)<br/>"},"metadata":{}},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":" View project at <a href='https://wandb.ai/devcode03-gujarat-technological-university/RadioML' target=\"_blank\">https://wandb.ai/devcode03-gujarat-technological-university/RadioML</a>"},"metadata":{}},{"output_type":"display_data","data":{"text/plain":"<IPython.core.display.HTML object>","text/html":" View run at <a href='https://wandb.ai/devcode03-gujarat-technological-university/RadioML/runs/d9nv2kbx' target=\"_blank\">https://wandb.ai/devcode03-gujarat-technological-university/RadioML/runs/d9nv2kbx</a>"},"metadata":{}},{"name":"stderr","text":"/opt/conda/lib/python3.10/site-packages/torch/nn/parallel/parallel_apply.py:79: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.\n  with torch.cuda.device(device), torch.cuda.stream(stream), autocast(enabled=autocast_enabled):\n","output_type":"stream"}]},{"cell_type":"code","source":"","metadata":{},"execution_count":null,"outputs":[]}]}
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "ef81f8b6",
+   "metadata": {
+    "_cell_guid": "b1076dfc-b9ad-4769-8c92-a6c4dae69d19",
+    "_uuid": "8f2839f25d086af736a60e9eeb907d3b93b6e0e5",
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:51:51.965823Z",
+     "iopub.status.busy": "2024-09-08T19:51:51.965411Z",
+     "iopub.status.idle": "2024-09-08T19:51:58.472088Z",
+     "shell.execute_reply": "2024-09-08T19:51:58.471067Z"
+    },
+    "papermill": {
+     "duration": 6.514923,
+     "end_time": "2024-09-08T19:51:58.474484",
+     "exception": false,
+     "start_time": "2024-09-08T19:51:51.959561",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# imports\n",
+    "import h5py\n",
+    "import wandb\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "from time import time\n",
+    "import matplotlib.pyplot as plt\n",
+    "from sklearn.model_selection import train_test_split\n",
+    "from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay\n",
+    "\n",
+    "import torch\n",
+    "import torch.nn as nn\n",
+    "import torch.optim as optim\n",
+    "import torch.nn.functional as F\n",
+    "from torch.utils.data import DataLoader, Dataset"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "f34348c3",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:51:58.484324Z",
+     "iopub.status.busy": "2024-09-08T19:51:58.483615Z",
+     "iopub.status.idle": "2024-09-08T19:51:58.500220Z",
+     "shell.execute_reply": "2024-09-08T19:51:58.499485Z"
+    },
+    "papermill": {
+     "duration": 0.023198,
+     "end_time": "2024-09-08T19:51:58.502055",
+     "exception": false,
+     "start_time": "2024-09-08T19:51:58.478857",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# Read the dataset\n",
+    "dataset_file = h5py.File(\"/kaggle/input/radioml2018/GOLD_XYZ_OSC.0001_1024.hdf5\", \"r\")\n",
+    "\n",
+    "# Base modulation classes\n",
+    "base_modulation_classes = [\n",
+    "    'OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK',\n",
+    "    '16APSK', '32APSK', '64APSK', '128APSK', '16QAM', '32QAM', '64QAM',\n",
+    "    '128QAM', '256QAM', 'AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC',\n",
+    "    'FM', 'GMSK', 'OQPSK'\n",
+    "]\n",
+    "\n",
+    "# Selected modulation classes\n",
+    "selected_modulation_classes = [\n",
+    "    '4ASK', 'BPSK', 'QPSK', '16PSK', '16QAM', 'FM', 'AM-DSB-WC', '32APSK'\n",
+    "]\n",
+    "\n",
+    "# Get the indices of selected modulation classes\n",
+    "selected_classes_id = [base_modulation_classes.index(cls) for cls in selected_modulation_classes]"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "158f5cd7",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:51:58.511105Z",
+     "iopub.status.busy": "2024-09-08T19:51:58.510793Z",
+     "iopub.status.idle": "2024-09-08T19:51:58.534076Z",
+     "shell.execute_reply": "2024-09-08T19:51:58.533202Z"
+    },
+    "papermill": {
+     "duration": 0.030128,
+     "end_time": "2024-09-08T19:51:58.536053",
+     "exception": false,
+     "start_time": "2024-09-08T19:51:58.505925",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# Model\n",
+    "\n",
+    "class SEBlock(nn.Module):\n",
+    "    \"\"\" Squeeze-and-Excitation Block \"\"\"\n",
+    "    def __init__(self, channels, reduction=16):\n",
+    "        super(SEBlock, self).__init__()\n",
+    "        self.se = nn.Sequential(\n",
+    "            nn.AdaptiveAvgPool2d(1),\n",
+    "            nn.Conv2d(channels, channels // reduction, 1),\n",
+    "            nn.ReLU(),\n",
+    "            nn.Conv2d(channels // reduction, channels, 1),\n",
+    "            nn.Sigmoid()\n",
+    "        )\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        scale = self.se(x)\n",
+    "        return x * scale\n",
+    "\n",
+    "class MultiHeadAttention(nn.Module):\n",
+    "    \"\"\" Multi-Head Attention Module \"\"\"\n",
+    "    def __init__(self, d_model, num_heads):\n",
+    "        super(MultiHeadAttention, self).__init__()\n",
+    "        self.attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)\n",
+    "\n",
+    "    def forward(self, x):\n",
+    "        attn_output, _ = self.attention(x, x, x)\n",
+    "        return attn_output\n",
+    "\n",
+    "class RadioNet(nn.Module):\n",
+    "    def __init__(self, num_classes):\n",
+    "        super(RadioNet, self).__init__()\n",
+    "\n",
+    "        # Separate Convolutional Pathways for I and Q\n",
+    "        self.q_conv = nn.Sequential(\n",
+    "            nn.Conv2d(1, 64, 3, padding=1),\n",
+    "            nn.BatchNorm2d(64),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            SEBlock(64),\n",
+    "            nn.Conv2d(64, 128, 3, padding=1),\n",
+    "            nn.BatchNorm2d(128),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            nn.MaxPool2d(2, stride=2),\n",
+    "            nn.Conv2d(128, 256, 3, padding=1),\n",
+    "            nn.BatchNorm2d(256),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            SEBlock(256),\n",
+    "            nn.MaxPool2d(2, stride=2)\n",
+    "        )\n",
+    "\n",
+    "        self.i_conv = nn.Sequential(\n",
+    "            nn.Conv2d(1, 64, 3, padding=1),\n",
+    "            nn.BatchNorm2d(64),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            SEBlock(64),\n",
+    "            nn.Conv2d(64, 128, 3, padding=1),\n",
+    "            nn.BatchNorm2d(128),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            nn.MaxPool2d(2, stride=2),\n",
+    "            nn.Conv2d(128, 256, 3, padding=1),\n",
+    "            nn.BatchNorm2d(256),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            SEBlock(256),\n",
+    "            nn.MaxPool2d(2, stride=2)\n",
+    "        )\n",
+    "\n",
+    "        self.feature_size = self._get_conv_output((1, 32, 32))\n",
+    "\n",
+    "        # Bidirectional LSTM with Layer Normalization\n",
+    "        self.lstm = nn.LSTM(self.feature_size * 2, 512, num_layers=2, \n",
+    "                            batch_first=True, bidirectional=True, dropout=0.3)\n",
+    "        self.layer_norm = nn.LayerNorm(1024)  # Layer normalization after LSTM\n",
+    "\n",
+    "        # Multi-Head Attention with multiple heads\n",
+    "        self.multi_head_attn = MultiHeadAttention(1024, num_heads=8)\n",
+    "\n",
+    "        # Enhanced Fully Connected Layers with Dense Connections\n",
+    "        self.fc = nn.Sequential(\n",
+    "            nn.Linear(1024, 1024),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            nn.Dropout(0.5),\n",
+    "            nn.Linear(1024, 512),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            nn.Dropout(0.5),\n",
+    "            nn.Linear(512, 256),\n",
+    "            nn.LeakyReLU(0.1),\n",
+    "            nn.Dropout(0.3),\n",
+    "            nn.Linear(256, 64),\n",
+    "            nn.LeakyReLU(0.1)\n",
+    "        )\n",
+    "\n",
+    "        self.output = nn.Linear(64, num_classes)\n",
+    "\n",
+    "    def _get_conv_output(self, shape):\n",
+    "        input = torch.rand(1, *shape)\n",
+    "        output = self.q_conv(input)\n",
+    "        return int(torch.numel(output) / output.shape[0])\n",
+    "\n",
+    "    def forward(self, i_input, q_input):\n",
+    "        q = self.q_conv(q_input)\n",
+    "        q = q.view(q.size(0), -1)\n",
+    "\n",
+    "        i = self.i_conv(i_input)\n",
+    "        i = i.view(i.size(0), -1)\n",
+    "\n",
+    "        combined = torch.cat((q, i), dim=1)\n",
+    "        combined = combined.unsqueeze(1)  # Add sequence dimension\n",
+    "\n",
+    "        lstm_out, _ = self.lstm(combined)\n",
+    "        lstm_out = self.layer_norm(lstm_out)\n",
+    "\n",
+    "        # Apply Multi-Head Attention\n",
+    "        attn_output = self.multi_head_attn(lstm_out)\n",
+    "        context = torch.sum(attn_output, dim=1)  # Sum up the attended output\n",
+    "\n",
+    "        x = self.fc(context)\n",
+    "        x = self.output(x)\n",
+    "\n",
+    "        return torch.log_softmax(x, dim=1)\n",
+    "\n",
+    "def create_model(num_classes):\n",
+    "    model = RadioNet(num_classes)\n",
+    "    learning_rate = 0.0003\n",
+    "    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)\n",
+    "    loss_fn = nn.CrossEntropyLoss()\n",
+    "    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)\n",
+    "    return model, optimizer, loss_fn, scheduler"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "c7cee5d5",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:51:58.544745Z",
+     "iopub.status.busy": "2024-09-08T19:51:58.544446Z",
+     "iopub.status.idle": "2024-09-08T19:52:01.246551Z",
+     "shell.execute_reply": "2024-09-08T19:52:01.245495Z"
+    },
+    "papermill": {
+     "duration": 2.70946,
+     "end_time": "2024-09-08T19:52:01.249261",
+     "exception": false,
+     "start_time": "2024-09-08T19:51:58.539801",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "/opt/conda/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:60: UserWarning: The verbose parameter is deprecated. Please use get_last_lr() to access the learning rate.\n",
+      "  warnings.warn(\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Initialize model, optimizer, and loss function\n",
+    "num_classes = len(selected_modulation_classes)\n",
+    "model, optimizer, loss_fn, scheduler = create_model(num_classes)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "c21955a5",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:01.260102Z",
+     "iopub.status.busy": "2024-09-08T19:52:01.259515Z",
+     "iopub.status.idle": "2024-09-08T19:52:01.699667Z",
+     "shell.execute_reply": "2024-09-08T19:52:01.698759Z"
+    },
+    "papermill": {
+     "duration": 0.447972,
+     "end_time": "2024-09-08T19:52:01.701880",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:01.253908",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "RadioNet(\n",
+       "  (q_conv): Sequential(\n",
+       "    (0): Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (2): LeakyReLU(negative_slope=0.1)\n",
+       "    (3): SEBlock(\n",
+       "      (se): Sequential(\n",
+       "        (0): AdaptiveAvgPool2d(output_size=1)\n",
+       "        (1): Conv2d(64, 4, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (2): ReLU()\n",
+       "        (3): Conv2d(4, 64, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (4): Sigmoid()\n",
+       "      )\n",
+       "    )\n",
+       "    (4): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (5): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (6): LeakyReLU(negative_slope=0.1)\n",
+       "    (7): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n",
+       "    (8): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (9): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (10): LeakyReLU(negative_slope=0.1)\n",
+       "    (11): SEBlock(\n",
+       "      (se): Sequential(\n",
+       "        (0): AdaptiveAvgPool2d(output_size=1)\n",
+       "        (1): Conv2d(256, 16, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (2): ReLU()\n",
+       "        (3): Conv2d(16, 256, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (4): Sigmoid()\n",
+       "      )\n",
+       "    )\n",
+       "    (12): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n",
+       "  )\n",
+       "  (i_conv): Sequential(\n",
+       "    (0): Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (2): LeakyReLU(negative_slope=0.1)\n",
+       "    (3): SEBlock(\n",
+       "      (se): Sequential(\n",
+       "        (0): AdaptiveAvgPool2d(output_size=1)\n",
+       "        (1): Conv2d(64, 4, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (2): ReLU()\n",
+       "        (3): Conv2d(4, 64, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (4): Sigmoid()\n",
+       "      )\n",
+       "    )\n",
+       "    (4): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (5): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (6): LeakyReLU(negative_slope=0.1)\n",
+       "    (7): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n",
+       "    (8): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))\n",
+       "    (9): BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True)\n",
+       "    (10): LeakyReLU(negative_slope=0.1)\n",
+       "    (11): SEBlock(\n",
+       "      (se): Sequential(\n",
+       "        (0): AdaptiveAvgPool2d(output_size=1)\n",
+       "        (1): Conv2d(256, 16, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (2): ReLU()\n",
+       "        (3): Conv2d(16, 256, kernel_size=(1, 1), stride=(1, 1))\n",
+       "        (4): Sigmoid()\n",
+       "      )\n",
+       "    )\n",
+       "    (12): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)\n",
+       "  )\n",
+       "  (lstm): LSTM(32768, 512, num_layers=2, batch_first=True, dropout=0.3, bidirectional=True)\n",
+       "  (layer_norm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)\n",
+       "  (multi_head_attn): MultiHeadAttention(\n",
+       "    (attention): MultiheadAttention(\n",
+       "      (out_proj): NonDynamicallyQuantizableLinear(in_features=1024, out_features=1024, bias=True)\n",
+       "    )\n",
+       "  )\n",
+       "  (fc): Sequential(\n",
+       "    (0): Linear(in_features=1024, out_features=1024, bias=True)\n",
+       "    (1): LeakyReLU(negative_slope=0.1)\n",
+       "    (2): Dropout(p=0.5, inplace=False)\n",
+       "    (3): Linear(in_features=1024, out_features=512, bias=True)\n",
+       "    (4): LeakyReLU(negative_slope=0.1)\n",
+       "    (5): Dropout(p=0.5, inplace=False)\n",
+       "    (6): Linear(in_features=512, out_features=256, bias=True)\n",
+       "    (7): LeakyReLU(negative_slope=0.1)\n",
+       "    (8): Dropout(p=0.3, inplace=False)\n",
+       "    (9): Linear(in_features=256, out_features=64, bias=True)\n",
+       "    (10): LeakyReLU(negative_slope=0.1)\n",
+       "  )\n",
+       "  (output): Linear(in_features=64, out_features=8, bias=True)\n",
+       ")"
+      ]
+     },
+     "execution_count": 5,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Check if multiple GPUs are available and use them if possible\n",
+    "if torch.cuda.device_count() > 1:\n",
+    "    print(f\"Let's use {torch.cuda.device_count()} GPUs!\")\n",
+    "    # Wrap the model with DataParallel to parallelize across available GPUs\n",
+    "    model = nn.DataParallel(model)\n",
+    "\n",
+    "# Set device to CUDA if available, otherwise fallback to CPU\n",
+    "device = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\n",
+    "\n",
+    "# Move the model to the appropriate device (GPU or CPU)\n",
+    "model.to(device)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "523752f6",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:01.711880Z",
+     "iopub.status.busy": "2024-09-08T19:52:01.711508Z",
+     "iopub.status.idle": "2024-09-08T19:52:13.050846Z",
+     "shell.execute_reply": "2024-09-08T19:52:13.049754Z"
+    },
+    "papermill": {
+     "duration": 11.347117,
+     "end_time": "2024-09-08T19:52:13.053302",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:01.706185",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# Number of SNRs (from 30 SNR to 22 SNR)\n",
+    "N_SNR = 4 \n",
+    "\n",
+    "# Initialize placeholders for data\n",
+    "X_data = None\n",
+    "y_data = None\n",
+    "\n",
+    "# Loop through selected modulation classes\n",
+    "for id in selected_classes_id:\n",
+    "    # Load data slices based on indices\n",
+    "    X_slice = dataset_file['X'][(106496*(id+1) - 4096*N_SNR) : 106496*(id+1)]\n",
+    "    y_slice = dataset_file['Y'][(106496*(id+1) - 4096*N_SNR) : 106496*(id+1)]\n",
+    "    \n",
+    "    # Concatenate the slices to build the dataset\n",
+    "    if X_data is not None:\n",
+    "        X_data = np.concatenate([X_data, X_slice], axis=0)\n",
+    "        y_data = np.concatenate([y_data, y_slice], axis=0)\n",
+    "    else:\n",
+    "        X_data = X_slice\n",
+    "        y_data = y_slice\n",
+    "\n",
+    "# Reshape the X_data to the required shape (e.g., 32x32 with 2 channels)\n",
+    "X_data = X_data.reshape(len(X_data), 32, 32, 2)\n",
+    "\n",
+    "# Convert y_data to a DataFrame for easier manipulation\n",
+    "y_data_df = pd.DataFrame(y_data)\n",
+    "\n",
+    "# Drop columns where the sum is 0 (i.e., no modulation class data in that column)\n",
+    "for column in y_data_df.columns:\n",
+    "    if sum(y_data_df[column]) == 0:\n",
+    "        y_data_df = y_data_df.drop(columns=[column])\n",
+    "\n",
+    "# Assign the remaining columns to match the selected modulation classes\n",
+    "y_data_df.columns = selected_modulation_classes\n",
+    "\n",
+    "# Split the dataset into training and test sets (80-20 split)\n",
+    "X_train, X_test, y_train, y_test = train_test_split(X_data, y_data_df, test_size=0.2)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "aa38817b",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:13.063359Z",
+     "iopub.status.busy": "2024-09-08T19:52:13.063024Z",
+     "iopub.status.idle": "2024-09-08T19:52:13.325104Z",
+     "shell.execute_reply": "2024-09-08T19:52:13.323648Z"
+    },
+    "papermill": {
+     "duration": 0.269453,
+     "end_time": "2024-09-08T19:52:13.327295",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:13.057842",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Batch X shape: torch.Size([32, 32, 32, 2])\n",
+      "Batch y shape: torch.Size([32, 8])\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Define the custom Dataset class\n",
+    "class RadioMLDataset(Dataset):\n",
+    "    def __init__(self, X, y):\n",
+    "        self.X = torch.from_numpy(X).float().to(device)  # Convert X to a PyTorch tensor\n",
+    "        self.y = torch.from_numpy(y.values).float().to(device)  # Convert y to a PyTorch tensor\n",
+    "    \n",
+    "    def __len__(self):\n",
+    "        return len(self.X)  # Return the number of samples in the dataset\n",
+    "    \n",
+    "    def __getitem__(self, idx):\n",
+    "        return self.X[idx], self.y[idx]  # Return a sample and its corresponding label\n",
+    "\n",
+    "# Create Dataset objects for training and testing data\n",
+    "train_dataset = RadioMLDataset(X_train, y_train)\n",
+    "test_dataset = RadioMLDataset(X_test, y_test)\n",
+    "\n",
+    "# Create DataLoader objects for batching and shuffling data\n",
+    "batch_size = 32  # You can adjust the batch size as needed\n",
+    "train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  # Shuffle training data\n",
+    "test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)  # No shuffling for test data\n",
+    "\n",
+    "# Example of how to use the DataLoader\n",
+    "for batch_X, batch_y in train_loader:\n",
+    "    # batch_X and batch_y are PyTorch tensors\n",
+    "    # batch_X shape: (batch_size, 32, 32, 2)\n",
+    "    # batch_y shape: (batch_size, num_classes)\n",
+    "    print(f\"Batch X shape: {batch_X.shape}\")\n",
+    "    print(f\"Batch y shape: {batch_y.shape}\")\n",
+    "    break  # This breaks the loop after the first batch, just to demonstrate"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "fcbbfaff",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:13.337731Z",
+     "iopub.status.busy": "2024-09-08T19:52:13.336929Z",
+     "iopub.status.idle": "2024-09-08T19:52:13.342197Z",
+     "shell.execute_reply": "2024-09-08T19:52:13.341379Z"
+    },
+    "papermill": {
+     "duration": 0.01239,
+     "end_time": "2024-09-08T19:52:13.344056",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:13.331666",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": [
+    "# Training parameters\n",
+    "epochs = 25\n",
+    "patience = 10\n",
+    "best_acc = 0\n",
+    "no_improve = 0\n",
+    "path_checkpoint = \"model_checkpoint.pth\"\n",
+    "\n",
+    "# Training loop\n",
+    "train_losses, train_accs, val_losses, val_accs = [], [], [], []"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "8feee417",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:13.353753Z",
+     "iopub.status.busy": "2024-09-08T19:52:13.353202Z",
+     "iopub.status.idle": "2024-09-08T19:52:14.688263Z",
+     "shell.execute_reply": "2024-09-08T19:52:14.687164Z"
+    },
+    "papermill": {
+     "duration": 1.342399,
+     "end_time": "2024-09-08T19:52:14.690534",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:13.348135",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\u001b[34m\u001b[1mwandb\u001b[0m: W&B API key is configured. Use \u001b[1m`wandb login --relogin`\u001b[0m to force relogin\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \u001b[33mWARNING\u001b[0m If you're specifying your api key in code, ensure this code is not shared publicly.\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \u001b[33mWARNING\u001b[0m Consider setting the WANDB_API_KEY environment variable, or running `wandb login` from the command line.\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Appending key for api.wandb.ai to your netrc file: /root/.netrc\n"
+     ]
+    },
+    {
+     "data": {
+      "text/plain": [
+       "True"
+      ]
+     },
+     "execution_count": 9,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# wandb login\n",
+    "from kaggle_secrets import UserSecretsClient\n",
+    "\n",
+    "user_secrets = UserSecretsClient()\n",
+    "my_secret = user_secrets.get_secret(\"wandb_api_key\") \n",
+    "wandb.login(key=my_secret)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 10,
+   "id": "eb8fc801",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2024-09-08T19:52:14.702989Z",
+     "iopub.status.busy": "2024-09-08T19:52:14.702594Z",
+     "iopub.status.idle": "2024-09-08T21:00:43.868259Z",
+     "shell.execute_reply": "2024-09-08T21:00:43.867447Z"
+    },
+    "papermill": {
+     "duration": 4109.17429,
+     "end_time": "2024-09-08T21:00:43.870419",
+     "exception": false,
+     "start_time": "2024-09-08T19:52:14.696129",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Currently logged in as: \u001b[33mdevcode03\u001b[0m (\u001b[33mdevcode03-gujarat-technological-university\u001b[0m). Use \u001b[1m`wandb login --relogin`\u001b[0m to force relogin\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: wandb version 0.17.9 is available!  To upgrade, please run:\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:  $ pip install wandb --upgrade\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Tracking run with wandb version 0.17.7\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Run data is saved locally in \u001b[35m\u001b[1m/kaggle/working/wandb/run-20240908_195214-uhtx96sn\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Run \u001b[1m`wandb offline`\u001b[0m to turn off syncing.\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Syncing run \u001b[33mRadioNet\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: ⭐️ View project at \u001b[34m\u001b[4mhttps://wandb.ai/devcode03-gujarat-technological-university/RadioML\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: 🚀 View run at \u001b[34m\u001b[4mhttps://wandb.ai/devcode03-gujarat-technological-university/RadioML/runs/uhtx96sn\u001b[0m\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epoch 1/25, Train Loss: 0.8550, Train Acc: 0.5842, Val Loss: 0.7770, Val Acc: 0.6195\n",
+      "Epoch 2/25, Train Loss: 0.5791, Train Acc: 0.7378, Val Loss: 0.4573, Val Acc: 0.7940\n",
+      "Epoch 3/25, Train Loss: 0.4964, Train Acc: 0.7806, Val Loss: 0.4791, Val Acc: 0.7862\n",
+      "Epoch 4/25, Train Loss: 0.4787, Train Acc: 0.7901, Val Loss: 0.4214, Val Acc: 0.8227\n",
+      "Epoch 5/25, Train Loss: 0.4528, Train Acc: 0.7978, Val Loss: 0.4359, Val Acc: 0.8034\n",
+      "Epoch 6/25, Train Loss: 0.4021, Train Acc: 0.8168, Val Loss: 0.3105, Val Acc: 0.8669\n",
+      "Epoch 7/25, Train Loss: 0.3570, Train Acc: 0.8428, Val Loss: 0.2953, Val Acc: 0.8727\n",
+      "Epoch 8/25, Train Loss: 0.3429, Train Acc: 0.8517, Val Loss: 0.3035, Val Acc: 0.8644\n",
+      "Epoch 9/25, Train Loss: 0.3286, Train Acc: 0.8554, Val Loss: 0.4312, Val Acc: 0.8030\n",
+      "Epoch 10/25, Train Loss: 0.3284, Train Acc: 0.8559, Val Loss: 0.2614, Val Acc: 0.8850\n",
+      "Epoch 11/25, Train Loss: 0.3145, Train Acc: 0.8625, Val Loss: 0.2628, Val Acc: 0.8872\n",
+      "Epoch 12/25, Train Loss: 0.2948, Train Acc: 0.8720, Val Loss: 0.2886, Val Acc: 0.8726\n",
+      "Epoch 13/25, Train Loss: 0.2936, Train Acc: 0.8723, Val Loss: 0.2432, Val Acc: 0.8930\n",
+      "Epoch 14/25, Train Loss: 0.2759, Train Acc: 0.8790, Val Loss: 0.2257, Val Acc: 0.8961\n",
+      "Epoch 15/25, Train Loss: 0.2705, Train Acc: 0.8841, Val Loss: 0.2806, Val Acc: 0.8783\n",
+      "Epoch 16/25, Train Loss: 0.2516, Train Acc: 0.8887, Val Loss: 0.1989, Val Acc: 0.9081\n",
+      "Epoch 17/25, Train Loss: 0.2436, Train Acc: 0.8917, Val Loss: 0.1940, Val Acc: 0.9087\n",
+      "Epoch 18/25, Train Loss: 0.2302, Train Acc: 0.8971, Val Loss: 0.2048, Val Acc: 0.9056\n",
+      "Epoch 19/25, Train Loss: 0.2182, Train Acc: 0.9029, Val Loss: 0.1877, Val Acc: 0.9147\n",
+      "Epoch 20/25, Train Loss: 0.2130, Train Acc: 0.9045, Val Loss: 0.1779, Val Acc: 0.9166\n",
+      "Epoch 21/25, Train Loss: 0.2260, Train Acc: 0.9040, Val Loss: 0.1957, Val Acc: 0.9063\n",
+      "Epoch 22/25, Train Loss: 0.2061, Train Acc: 0.9053, Val Loss: 0.1792, Val Acc: 0.9175\n",
+      "Epoch 23/25, Train Loss: 0.1926, Train Acc: 0.9124, Val Loss: 0.1715, Val Acc: 0.9215\n",
+      "Epoch 24/25, Train Loss: 0.2304, Train Acc: 0.9083, Val Loss: 0.1952, Val Acc: 0.9086\n",
+      "Epoch 25/25, Train Loss: 0.1823, Train Acc: 0.9162, Val Loss: 0.1745, Val Acc: 0.9175\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "\u001b[34m\u001b[1mwandb\u001b[0m:                                                                                \n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Run history:\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:         epoch ▁▁▂▂▂▂▃▃▃▄▄▄▅▅▅▅▆▆▆▇▇▇▇██\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: learning_rate ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:     train_acc ▁▄▅▅▆▆▆▇▇▇▇▇▇▇▇▇▇████████\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:    train_loss █▅▄▄▄▃▃▃▃▃▂▂▂▂▂▂▂▁▁▁▁▁▁▁▁\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:       val_acc ▁▅▅▆▅▇▇▇▅▇▇▇▇▇▇██████████\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:      val_loss █▄▅▄▄▃▂▃▄▂▂▂▂▂▂▁▁▁▁▁▁▁▁▁▁\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Run summary:\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:         epoch 25\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: learning_rate 0.0003\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:     train_acc 0.91624\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:    train_loss 0.18233\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:       val_acc 0.91753\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m:      val_loss 0.17447\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: 🚀 View run \u001b[33mRadioNet\u001b[0m at: \u001b[34m\u001b[4mhttps://wandb.ai/devcode03-gujarat-technological-university/RadioML/runs/uhtx96sn\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: ⭐️ View project at: \u001b[34m\u001b[4mhttps://wandb.ai/devcode03-gujarat-technological-university/RadioML\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 1 other file(s)\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: Find logs at: \u001b[35m\u001b[1m./wandb/run-20240908_195214-uhtx96sn/logs\u001b[0m\n",
+      "\u001b[34m\u001b[1mwandb\u001b[0m: \u001b[33mWARNING\u001b[0m The new W&B backend becomes opt-out in version 0.18.0; try it out with `wandb.require(\"core\")`! See https://wandb.me/wandb-core for more information.\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Initialize wandb\n",
+    "wandb.init(project=\"RadioML\", name=\"RadioNet\")\n",
+    "\n",
+    "# Log model architecture\n",
+    "wandb.watch(model)\n",
+    "\n",
+    "for epoch in range(epochs):\n",
+    "    # Set model to training mode\n",
+    "    model.train()\n",
+    "    train_loss, train_correct = 0, 0\n",
+    "    # Training loop\n",
+    "    for batch_X, batch_y in train_loader:\n",
+    "        # Split the input into I and Q components\n",
+    "        i_input = batch_X[:, :, :, 0].unsqueeze(1)  # I component\n",
+    "        q_input = batch_X[:, :, :, 1].unsqueeze(1)  # Q component\n",
+    "        # Zero out the gradients\n",
+    "        optimizer.zero_grad()\n",
+    "        # Forward pass through the model\n",
+    "        outputs = model(i_input, q_input)\n",
+    "        # Compute loss\n",
+    "        loss = loss_fn(outputs, batch_y)\n",
+    "        # Backpropagation\n",
+    "        loss.backward()\n",
+    "        # Update model parameters\n",
+    "        optimizer.step()\n",
+    "        # Accumulate training loss and correct predictions\n",
+    "        train_loss += loss.item()\n",
+    "        train_correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()\n",
+    "    # Compute average training loss and accuracy\n",
+    "    train_loss /= len(train_loader)\n",
+    "    train_acc = train_correct / len(train_dataset)\n",
+    "    # Validation loop (without gradient updates)\n",
+    "    model.eval()\n",
+    "    val_loss, val_correct = 0, 0\n",
+    "    with torch.no_grad():\n",
+    "        for batch_X, batch_y in test_loader:\n",
+    "            # Split the input into I and Q components\n",
+    "            i_input = batch_X[:, :, :, 0].unsqueeze(1)  # I component\n",
+    "            q_input = batch_X[:, :, :, 1].unsqueeze(1)  # Q component\n",
+    "            # Forward pass through the model\n",
+    "            outputs = model(i_input, q_input)\n",
+    "            # Compute validation loss\n",
+    "            val_loss += loss_fn(outputs, batch_y).item()\n",
+    "            # Accumulate correct predictions\n",
+    "            val_correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()\n",
+    "    # Compute average validation loss and accuracy\n",
+    "    val_loss /= len(test_loader)\n",
+    "    val_acc = val_correct / len(test_dataset)\n",
+    "    # Save loss and accuracy for later plotting\n",
+    "    train_losses.append(train_loss)\n",
+    "    train_accs.append(train_acc)\n",
+    "    val_losses.append(val_loss)\n",
+    "    val_accs.append(val_acc)\n",
+    "\n",
+    "    # Log metrics to wandb\n",
+    "    wandb.log({\n",
+    "        \"epoch\": epoch + 1,\n",
+    "        \"train_loss\": train_loss,\n",
+    "        \"train_acc\": train_acc,\n",
+    "        \"val_loss\": val_loss,\n",
+    "        \"val_acc\": val_acc,\n",
+    "        \"learning_rate\": optimizer.param_groups[0]['lr']\n",
+    "    })\n",
+    "\n",
+    "    # Print progress for this epoch\n",
+    "    print(f\"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, \"\n",
+    "          f\"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}\")\n",
+    "    # Step the learning rate scheduler based on validation loss\n",
+    "    scheduler.step(val_loss)\n",
+    "    # Early stopping and model checkpointing\n",
+    "    if val_acc > best_acc:\n",
+    "        best_acc = val_acc\n",
+    "        torch.save(model.state_dict(), path_checkpoint)  # Save the model checkpoint\n",
+    "        wandb.save(path_checkpoint)  # Save the model checkpoint to wandb\n",
+    "        no_improve = 0  # Reset no improvement counter\n",
+    "    else:\n",
+    "        no_improve += 1\n",
+    "        if no_improve == patience:\n",
+    "            print(\"Early stopping\")\n",
+    "            break\n",
+    "\n",
+    "# Finish the wandb run\n",
+    "wandb.finish()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "28e4308a",
+   "metadata": {
+    "papermill": {
+     "duration": 0.007453,
+     "end_time": "2024-09-08T21:00:43.886034",
+     "exception": false,
+     "start_time": "2024-09-08T21:00:43.878581",
+     "status": "completed"
+    },
+    "tags": []
+   },
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kaggle": {
+   "accelerator": "gpu",
+   "dataSources": [
+    {
+     "datasetId": 1493018,
+     "sourceId": 2468162,
+     "sourceType": "datasetVersion"
+    }
+   ],
+   "dockerImageVersionId": 30762,
+   "isGpuEnabled": true,
+   "isInternetEnabled": true,
+   "language": "python",
+   "sourceType": "notebook"
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.10.14"
+  },
+  "papermill": {
+   "default_parameters": {},
+   "duration": 4137.364204,
+   "end_time": "2024-09-08T21:00:46.612188",
+   "environment_variables": {},
+   "exception": null,
+   "input_path": "__notebook__.ipynb",
+   "output_path": "__notebook__.ipynb",
+   "parameters": {},
+   "start_time": "2024-09-08T19:51:49.247984",
+   "version": "2.6.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
